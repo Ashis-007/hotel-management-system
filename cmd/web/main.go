@@ -1,88 +1,164 @@
 package main
 
 import (
-	"log"
+	"fmt"
 	"net/http"
+	"os"
 	"time"
 
-	"github.com/Ashis-007/hms/config"
-	"github.com/Ashis-007/hms/db"
-	"github.com/go-chi/chi/v5"
-	"github.com/go-chi/chi/v5/middleware"
-	"github.com/go-chi/cors"
+	"github.com/Ashis-007/hms/internal/model"
+	loggerPkg "github.com/Ashis-007/hms/pkg/logger"
+	"github.com/Ashis-007/hms/pkg/response"
+	"github.com/gin-contrib/cors"
+	"github.com/gin-gonic/gin"
 	"github.com/jmoiron/sqlx"
+	_ "github.com/lib/pq"
+	"github.com/spf13/viper"
+	"go.uber.org/zap"
 )
 
-type AppConfig struct {
-	db *sqlx.DB
+var logger = loggerPkg.GetLogger()
+
+func initConfig() (*Config, error) {
+	envType := os.Getenv("GO_ENV")
+
+	configFileName := "config"
+	if envType == "development" {
+		configFileName = "config.local"
+	}
+
+	// Initialize Viper
+	viper.SetConfigName(configFileName) // The name of your configuration file (without extension)
+	viper.AddConfigPath(".")            // Search in the current directory
+	viper.SetConfigType("yaml")         // Set the configuration file type
+
+	// Read the configuration file
+	if err := viper.ReadInConfig(); err != nil {
+		logger.Error("error while reading config file", zap.Error(err))
+		return nil, err
+	}
+
+	config := &Config{}
+
+	// Unmarshal the configuration into a struct
+	if err := viper.Unmarshal(config); err != nil {
+		logger.Error("error while unmarshalling config file", zap.Error(err))
+		return nil, err
+	}
+
+	return config, nil
 }
 
-var App AppConfig
+func connectDB(config *Config) (*sqlx.DB, error) {
+	dsn := config.DBDSN
+	if dsn == "" {
+		dsn = fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s", config.DBHost, config.DBPort, config.DBUser, config.DBPassword, config.DBName)
+	}
+	db, err := sqlx.Connect("postgres", dsn)
+	if err != nil {
+		logger.Error("error while connecting to db", zap.Error(err))
+		return nil, err
+	}
+
+	return db, nil
+}
+
+func logRoutesMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		start := time.Now() // Start timer
+		path := c.Request.URL.Path
+		raw := c.Request.URL.RawQuery
+
+		// Process request
+		c.Next()
+
+		// Fill the params
+		param := gin.LogFormatterParams{}
+
+		param.TimeStamp = time.Now() // Stop timer
+		param.Latency = param.TimeStamp.Sub(start)
+		if param.Latency > time.Minute {
+			param.Latency = param.Latency.Truncate(time.Second)
+		}
+
+		param.ClientIP = c.ClientIP()
+		param.Method = c.Request.Method
+		param.StatusCode = c.Writer.Status()
+		param.ErrorMessage = c.Errors.ByType(gin.ErrorTypePrivate).String()
+		param.BodySize = c.Writer.Size()
+		if raw != "" {
+			path = path + "?" + raw
+		}
+		param.Path = path
+
+		// contextUser, _ := pkg.GetContextUser(c)
+		// if contextUser.UserID.Valid {
+		// 	log.Info("", zap.Any("method", param.Method), zap.Any("path", param.Path), zap.Any("status", param.StatusCode), zap.Any("latency", param.Latency.Round(time.Millisecond).String()), zap.Any("uid", contextUser.UserID))
+		// } else {
+		// 	log.Info("", zap.Any("method", param.Method), zap.Any("path", param.Path), zap.Any("status", param.StatusCode), zap.Any("latency", param.Latency.Round(time.Millisecond).String()))
+		// }
+	}
+}
 
 func main() {
+	startTime := time.Now()
+
+	fmt.Println(logoAscii)
+
 	// load config
-	env, err := config.LoadEnv("../../")
+	config, err := initConfig()
 	if err != nil {
-		return
+		panic(err)
 	}
 
-	App = AppConfig{}
-
-	err = runServer(env, &App)
+	db, err := connectDB(config)
 	if err != nil {
-		log.Fatal("an error occurred while running server: ", err)
-		return
+		panic(err)
 	}
-}
+	logger.Info("[DATABASE] successfully connected to database")
 
-func runServer(env config.Env, app *AppConfig) error {
-	router := createRouter()
+	model.SetPostgresDB(db)
 
-	appDB, err := db.ConnectDB(env)
-	if err != nil {
-		return err
-	}
-	defer appDB.Close()
+	fmt.Println(db)
 
-	app.db = appDB
+	// initialise gin app
+	gin.SetMode(gin.ReleaseMode)
 
-	// start server
-	http.ListenAndServe(env.Port, router)
+	r := gin.New()
 
-	return nil
-}
-
-func createV1Router() chi.Router {
-	v1Router := chi.NewRouter()
-	return v1Router
-}
-
-func createRouter() chi.Router {
-	// initialize chi router
-	router := chi.NewRouter()
-
-	// middlewares
-	router.Use(middleware.RequestID)
-	router.Use(middleware.Logger)
-	router.Use(middleware.Recoverer)
-
-	router.Use(cors.Handler(cors.Options{
-		AllowedOrigins:   []string{"https://*", "http://*"},
-		AllowedMethods:   []string{"GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"},
-		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "X-CSRF-Token"},
-		ExposedHeaders:   []string{"Link"},
-		AllowCredentials: false,
-		MaxAge:           300, // Maximum value not ignored by any of major browsers
+	r.RemoveExtraSlash = true
+	r.Use(cors.New(cors.Config{
+		AllowOrigins:     []string{"http://localhost:8080", "*"}, // TODO: restrict origins
+		AllowMethods:     []string{http.MethodGet, http.MethodPatch, http.MethodPost, http.MethodPut, http.MethodDelete, http.MethodHead, http.MethodOptions},
+		AllowHeaders:     []string{"Content-Type", "X-XSRF-TOKEN", "Accept", "Origin", "Authorization"},
+		ExposeHeaders:    []string{"Content-Length"},
+		AllowCredentials: true,
 	}))
+	r.Use(logRoutesMiddleware())
+	r.Use(gin.Recovery())
 
-	// Set a timeout value on the request context (ctx), that will signal
-	// through ctx.Done() that the request has timed out and further
-	// processing should be stopped.
-	router.Use(middleware.Timeout(60 * time.Second))
+	r.GET("/healthcheck", func(c *gin.Context) {
+		response.OkResponse(c, &response.Response{
+			Msg: "Backend server up and running",
+		})
+	})
 
-	v1Router := createV1Router()
+	r.GET("/uptime", func(c *gin.Context) {
+		response.OkResponse(c, &response.Response{
+			Msg: "Backend server up and running",
+			Data: map[string]string{
+				"uptime": time.Duration(time.Since(startTime)).Round(time.Second).String(),
+			},
+		})
+	})
 
-	router.Mount("/v1", v1Router)
+	serverUrl := fmt.Sprintf(":%s", config.Port)
 
-	return router
+	logger.Info(fmt.Sprintf("🚀 [SERVER INIT] successfully started server at port %s", config.Port))
+
+	err = r.Run(serverUrl)
+	if err != nil {
+		logger.Error("error while starting server", zap.Error(err))
+		panic(err)
+	}
 }

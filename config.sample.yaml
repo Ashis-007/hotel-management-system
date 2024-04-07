@@ -1,0 +1,10 @@
+go_env:
+port:
+db_dsn:
+db_name:
+db_host:
+db_port:
+db_user:
+db_password:
+jwt_secret:
+jwt_salt:
